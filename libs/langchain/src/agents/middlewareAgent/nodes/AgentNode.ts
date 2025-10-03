@@ -251,7 +251,7 @@ export class AgentNode<
     options: {
       lastMessage?: string;
     } = {}
-  ): Promise<AIMessage | ResponseHandlerResult<StructuredResponseFormat>> {
+  ) {
     const model = await this.#deriveModel();
 
     /**
@@ -290,7 +290,11 @@ export class AgentNode<
     }
 
     const signal = mergeAbortSignals(this.#options.signal, config.signal);
-    const invokeConfig = { ...config, signal };
+    const invokeConfig = {
+      ...config,
+      signal,
+      ...preparedOptions?.callOptions,
+    };
     const response = (await modelWithTools.invoke(
       modelInput,
       invokeConfig
