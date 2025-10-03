@@ -27,3 +27,4 @@ export {
   type PIIRedactionMiddlewareConfig,
 } from "./piiRedaction.js";
 export { type AgentMiddleware } from "../types.js";
+export { anthropicCodeExecutionMiddleware } from "./anthropicCodeExecution.js";
