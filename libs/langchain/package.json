@@ -32,6 +32,7 @@
     "format:check": "prettier --config .prettierrc --check \"src\""
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.56.0",
     "@langchain/anthropic": "workspace:*",
     "@langchain/cohere": "workspace:*",
     "@langchain/core": "workspace:*",
