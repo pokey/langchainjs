@@ -2,19 +2,16 @@
  * Anthropic text editor and memory tool middleware.
  *
  * This module provides client-side implementations of Anthropic's text editor and
- * memory tools using schema-less tool definitions and tool call interception.
+ * memory tools using proper tool definitions with providerToolDefinition.
  */
 
 import { ToolMessage } from "@langchain/core/messages";
-import { Command } from "@langchain/langgraph";
+import { tool } from "@langchain/core/tools";
+import { Command, getCurrentTaskInput } from "@langchain/langgraph";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
-import type {
-  AgentMiddleware,
-  WrapModelCallHook,
-  WrapToolCallHook,
-} from "./types.js";
+import { createMiddleware } from "../index.js";
 
 // Tool type constants
 export const TEXT_EDITOR_TOOL_TYPE = "text_editor_20250728";
@@ -110,6 +107,68 @@ const MemoryStateSchema = z.object({
 });
 
 /**
+ * Command schemas for file tools (text editor and memory).
+ * These match Anthropic's built-in tool command structure.
+ */
+const ViewCommandSchema = z.object({
+  command: z.literal("view"),
+  path: z.string().describe("Path to the file or directory to view"),
+  view_range: z
+    .tuple([z.number(), z.number()])
+    .optional()
+    .describe(
+      "Optional line range to view [start, end]. Only applies to files, not directories."
+    ),
+});
+
+const CreateCommandSchema = z.object({
+  command: z.literal("create"),
+  path: z.string().describe("Path where the new file should be created"),
+  file_text: z.string().describe("Content to write to the new file"),
+});
+
+const StrReplaceCommandSchema = z.object({
+  command: z.literal("str_replace"),
+  path: z.string().describe("Path to the file to modify"),
+  old_str: z
+    .string()
+    .describe("Text to replace (must match exactly, including whitespace)"),
+  new_str: z.string().describe("New text to insert in place of old text"),
+});
+
+const InsertCommandSchema = z.object({
+  command: z.literal("insert"),
+  path: z.string().describe("Path to the file to modify"),
+  insert_line: z
+    .number()
+    .describe("Line number after which to insert text (0 for beginning)"),
+  new_str: z.string().describe("Text to insert"),
+});
+
+const DeleteCommandSchema = z.object({
+  command: z.literal("delete"),
+  path: z.string().describe("Path to the file or directory to delete"),
+});
+
+const RenameCommandSchema = z.object({
+  command: z.literal("rename"),
+  old_path: z.string().describe("Current path of the file/directory"),
+  new_path: z.string().describe("New path for the file/directory"),
+});
+
+/**
+ * Discriminated union of all file tool commands.
+ */
+const FileToolCommandSchema = z.discriminatedUnion("command", [
+  ViewCommandSchema,
+  CreateCommandSchema,
+  StrReplaceCommandSchema,
+  InsertCommandSchema,
+  DeleteCommandSchema,
+  RenameCommandSchema,
+]);
+
+/**
  * Validate and normalize file path for security.
  * @param filePath - The path to validate
  * @param allowedPrefixes - Optional list of allowed path prefixes
@@ -182,379 +241,238 @@ function listDirectory(
 }
 
 /**
- * Base class for state-based file tool middleware (internal).
+ * Helper function to create a state-based file tool handler.
+ * Handles command execution and state updates for text editor and memory tools.
  */
-class StateClaudeFileToolMiddleware implements AgentMiddleware {
-  name: string;
+function createStateFileToolHandler(options: {
+  toolName: string;
+  stateKey: "text_editor_files" | "memory_files";
+  allowedPrefixes?: string[];
+}) {
+  return async (
+    args: z.infer<typeof FileToolCommandSchema>,
+    config: any
+  ): Promise<Command> => {
+    const state = await getCurrentTaskInput<AnthropicToolsState>(config);
+    const files = (state[options.stateKey] || {}) as Record<string, FileData>;
+    const toolCallId = config.toolCall?.id as string;
 
-  protected toolType: string;
-
-  protected toolName: string;
-
-  protected stateKey: string;
-
-  protected allowedPrefixes?: string[];
-
-  protected systemPrompt?: string;
-
-  constructor(options: {
-    toolType: string;
-    toolName: string;
-    stateKey: string;
-    allowedPathPrefixes?: string[];
-    systemPrompt?: string;
-  }) {
-    this.toolType = options.toolType;
-    this.toolName = options.toolName;
-    this.stateKey = options.stateKey;
-    this.allowedPrefixes = options.allowedPathPrefixes;
-    this.systemPrompt = options.systemPrompt;
-    this.name = `StateClaudeFileToolMiddleware(${this.toolName})`;
-  }
-
-  wrapModelCall: WrapModelCallHook = async (request, handler) => {
-    // Add tool
-    const tools = [...(request.tools || [])];
-    tools.push({
-      type: this.toolType,
-      name: this.toolName,
-    });
-    request.tools = tools;
-
-    // Inject system prompt if provided
-    if (this.systemPrompt) {
-      request.systemPrompt = request.systemPrompt
-        ? `${request.systemPrompt}\n\n${this.systemPrompt}`
-        : this.systemPrompt;
-    }
-
-    return handler(request);
-  };
-
-  wrapToolCall: WrapToolCallHook = async (request, handler) => {
-    const toolCall = request.toolCall;
-    const toolName = toolCall.name;
-
-    if (toolName !== this.toolName) {
-      return handler(request);
-    }
-
-    // Handle tool call
     try {
-      const args = (toolCall.args || {}) as Record<string, unknown>;
-      const command = args.command as string;
-      const state = request.state as AnthropicToolsState;
+      switch (args.command) {
+        case "view": {
+          const normalizedPath = validatePath(args.path, options.allowedPrefixes);
+          const fileData = files[normalizedPath];
 
-      if (command === "view") {
-        return this.handleView(args, state, toolCall.id);
-      }
-      if (command === "create") {
-        return this.handleCreate(args, state, toolCall.id);
-      }
-      if (command === "str_replace") {
-        return this.handleStrReplace(args, state, toolCall.id);
-      }
-      if (command === "insert") {
-        return this.handleInsert(args, state, toolCall.id);
-      }
-      if (command === "delete") {
-        return this.handleDelete(args, state, toolCall.id);
-      }
-      if (command === "rename") {
-        return this.handleRename(args, state, toolCall.id);
-      }
+          if (!fileData) {
+            // Try directory listing
+            const matching = listDirectory(files, normalizedPath);
 
-      return new ToolMessage({
-        content: `Unknown command: ${command}`,
-        tool_call_id: toolCall.id!,
-        name: toolName,
-        status: "error",
-      });
+            if (matching.length > 0) {
+              const content = matching.join("\n");
+              return new Command({
+                update: {
+                  messages: [
+                    new ToolMessage({
+                      content,
+                      tool_call_id: toolCallId,
+                      name: options.toolName,
+                    }),
+                  ],
+                },
+              });
+            }
+
+            throw new Error(`File not found: ${args.path}`);
+          }
+
+          // Format file content with line numbers
+          const linesContent = fileData.content;
+          const formattedLines = linesContent.map((line, i) => `${i + 1}|${line}`);
+          const content = formattedLines.join("\n");
+
+          return new Command({
+            update: {
+              messages: [
+                new ToolMessage({
+                  content,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
+
+        case "create": {
+          const normalizedPath = validatePath(args.path, options.allowedPrefixes);
+          const existing = files[normalizedPath];
+
+          // Create file data
+          const now = new Date().toISOString();
+          const createdAt = existing ? existing.created_at : now;
+          const contentLines = args.file_text.split("\n");
+
+          return new Command({
+            update: {
+              [options.stateKey]: {
+                [normalizedPath]: {
+                  content: contentLines,
+                  created_at: createdAt,
+                  modified_at: now,
+                },
+              },
+              messages: [
+                new ToolMessage({
+                  content: `File created: ${args.path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
+
+        case "str_replace": {
+          const normalizedPath = validatePath(args.path, options.allowedPrefixes);
+          const fileData = files[normalizedPath];
+          if (!fileData) {
+            throw new Error(`File not found: ${args.path}`);
+          }
+
+          const content = fileData.content.join("\n");
+
+          // Replace string
+          if (!content.includes(args.old_str)) {
+            throw new Error(`String not found in file: ${args.old_str}`);
+          }
+
+          const newContent = content.replace(args.old_str, args.new_str);
+          const newLines = newContent.split("\n");
+
+          // Update file
+          const now = new Date().toISOString();
+
+          return new Command({
+            update: {
+              [options.stateKey]: {
+                [normalizedPath]: {
+                  content: newLines,
+                  created_at: fileData.created_at,
+                  modified_at: now,
+                },
+              },
+              messages: [
+                new ToolMessage({
+                  content: `String replaced in ${args.path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
+
+        case "insert": {
+          const normalizedPath = validatePath(args.path, options.allowedPrefixes);
+          const fileData = files[normalizedPath];
+          if (!fileData) {
+            throw new Error(`File not found: ${args.path}`);
+          }
+
+          const newLines = args.new_str.split("\n");
+
+          // Insert after insert_line (0-indexed)
+          const updatedLines = [
+            ...fileData.content.slice(0, args.insert_line),
+            ...newLines,
+            ...fileData.content.slice(args.insert_line),
+          ];
+
+          // Update file
+          const now = new Date().toISOString();
+
+          return new Command({
+            update: {
+              [options.stateKey]: {
+                [normalizedPath]: {
+                  content: updatedLines,
+                  created_at: fileData.created_at,
+                  modified_at: now,
+                },
+              },
+              messages: [
+                new ToolMessage({
+                  content: `Text inserted in ${args.path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
+
+        case "delete": {
+          const normalizedPath = validatePath(args.path, options.allowedPrefixes);
+
+          return new Command({
+            update: {
+              [options.stateKey]: { [normalizedPath]: null },
+              messages: [
+                new ToolMessage({
+                  content: `File deleted: ${args.path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
+
+        case "rename": {
+          const normalizedOld = validatePath(args.old_path, options.allowedPrefixes);
+          const normalizedNew = validatePath(args.new_path, options.allowedPrefixes);
+
+          const fileData = files[normalizedOld];
+          if (!fileData) {
+            throw new Error(`File not found: ${args.old_path}`);
+          }
+
+          // Update timestamp
+          const now = new Date().toISOString();
+          const fileDataCopy = { ...fileData, modified_at: now };
+
+          return new Command({
+            update: {
+              [options.stateKey]: {
+                [normalizedOld]: null,
+                [normalizedNew]: fileDataCopy,
+              },
+              messages: [
+                new ToolMessage({
+                  content: `File renamed: ${args.old_path} -> ${args.new_path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
+      }
     } catch (error) {
-      return new ToolMessage({
-        content: String(error),
-        tool_call_id: toolCall.id!,
-        name: toolName,
-        status: "error",
+      return new Command({
+        update: {
+          messages: [
+            new ToolMessage({
+              content: String(error),
+              tool_call_id: toolCallId,
+              name: options.toolName,
+              status: "error",
+            }),
+          ],
+        },
       });
     }
   };
-
-  protected handleView(
-    args: Record<string, unknown>,
-    state: AnthropicToolsState,
-    toolCallId: string | undefined
-  ): Command {
-    const filePath = args.path as string;
-    const normalizedPath = validatePath(filePath, this.allowedPrefixes);
-
-    const files =
-      (state[this.stateKey as keyof AnthropicToolsState] as Record<
-        string,
-        FileData
-      >) || {};
-    const fileData = files[normalizedPath];
-
-    if (!fileData) {
-      // Try directory listing
-      const matching = listDirectory(files, normalizedPath);
-
-      if (matching.length > 0) {
-        const content = matching.join("\n");
-        return new Command({
-          update: {
-            messages: [
-              new ToolMessage({
-                content,
-                tool_call_id: toolCallId!,
-                name: this.toolName,
-              }),
-            ],
-          },
-        });
-      }
-
-      throw new Error(`File not found: ${filePath}`);
-    }
-
-    // Format file content with line numbers
-    const linesContent = fileData.content;
-    const formattedLines = linesContent.map((line, i) => `${i + 1}|${line}`);
-    const content = formattedLines.join("\n");
-
-    return new Command({
-      update: {
-        messages: [
-          new ToolMessage({
-            content,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
-
-  protected handleCreate(
-    args: Record<string, unknown>,
-    state: AnthropicToolsState,
-    toolCallId: string | undefined
-  ): Command {
-    const filePath = args.path as string;
-    const fileText = args.file_text as string;
-
-    const normalizedPath = validatePath(filePath, this.allowedPrefixes);
-
-    // Get existing files
-    const files =
-      (state[this.stateKey as keyof AnthropicToolsState] as Record<
-        string,
-        FileData
-      >) || {};
-    const existing = files[normalizedPath];
-
-    // Create file data
-    const now = new Date().toISOString();
-    const createdAt = existing ? existing.created_at : now;
-
-    const contentLines = fileText.split("\n");
-
-    return new Command({
-      update: {
-        [this.stateKey]: {
-          [normalizedPath]: {
-            content: contentLines,
-            created_at: createdAt,
-            modified_at: now,
-          },
-        },
-        messages: [
-          new ToolMessage({
-            content: `File created: ${filePath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
-
-  protected handleStrReplace(
-    args: Record<string, unknown>,
-    state: AnthropicToolsState,
-    toolCallId: string | undefined
-  ): Command {
-    const filePath = args.path as string;
-    const oldStr = args.old_str as string;
-    const newStr = (args.new_str as string) || "";
-
-    const normalizedPath = validatePath(filePath, this.allowedPrefixes);
-
-    // Read file
-    const files =
-      (state[this.stateKey as keyof AnthropicToolsState] as Record<
-        string,
-        FileData
-      >) || {};
-    const fileData = files[normalizedPath];
-    if (!fileData) {
-      throw new Error(`File not found: ${filePath}`);
-    }
-
-    const linesContent = fileData.content;
-    const content = linesContent.join("\n");
-
-    // Replace string
-    if (!content.includes(oldStr)) {
-      throw new Error(`String not found in file: ${oldStr}`);
-    }
-
-    const newContent = content.replace(oldStr, newStr);
-    const newLines = newContent.split("\n");
-
-    // Update file
-    const now = new Date().toISOString();
-
-    return new Command({
-      update: {
-        [this.stateKey]: {
-          [normalizedPath]: {
-            content: newLines,
-            created_at: fileData.created_at,
-            modified_at: now,
-          },
-        },
-        messages: [
-          new ToolMessage({
-            content: `String replaced in ${filePath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
-
-  protected handleInsert(
-    args: Record<string, unknown>,
-    state: AnthropicToolsState,
-    toolCallId: string | undefined
-  ): Command {
-    const filePath = args.path as string;
-    const insertLine = args.insert_line as number;
-    const textToInsert = args.new_str as string;
-
-    const normalizedPath = validatePath(filePath, this.allowedPrefixes);
-
-    // Read file
-    const files =
-      (state[this.stateKey as keyof AnthropicToolsState] as Record<
-        string,
-        FileData
-      >) || {};
-    const fileData = files[normalizedPath];
-    if (!fileData) {
-      throw new Error(`File not found: ${filePath}`);
-    }
-
-    const linesContent = fileData.content;
-    const newLines = textToInsert.split("\n");
-
-    // Insert after insert_line (0-indexed)
-    const updatedLines = [
-      ...linesContent.slice(0, insertLine),
-      ...newLines,
-      ...linesContent.slice(insertLine),
-    ];
-
-    // Update file
-    const now = new Date().toISOString();
-
-    return new Command({
-      update: {
-        [this.stateKey]: {
-          [normalizedPath]: {
-            content: updatedLines,
-            created_at: fileData.created_at,
-            modified_at: now,
-          },
-        },
-        messages: [
-          new ToolMessage({
-            content: `Text inserted in ${filePath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
-
-  protected handleDelete(
-    args: Record<string, unknown>,
-    _state: AnthropicToolsState,
-    toolCallId: string | undefined
-  ): Command {
-    const filePath = args.path as string;
-
-    const normalizedPath = validatePath(filePath, this.allowedPrefixes);
-
-    return new Command({
-      update: {
-        [this.stateKey]: { [normalizedPath]: null },
-        messages: [
-          new ToolMessage({
-            content: `File deleted: ${filePath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
-
-  protected handleRename(
-    args: Record<string, unknown>,
-    state: AnthropicToolsState,
-    toolCallId: string | undefined
-  ): Command {
-    const oldPath = args.old_path as string;
-    const newPath = args.new_path as string;
-
-    const normalizedOld = validatePath(oldPath, this.allowedPrefixes);
-    const normalizedNew = validatePath(newPath, this.allowedPrefixes);
-
-    // Read file
-    const files =
-      (state[this.stateKey as keyof AnthropicToolsState] as Record<
-        string,
-        FileData
-      >) || {};
-    const fileData = files[normalizedOld];
-    if (!fileData) {
-      throw new Error(`File not found: ${oldPath}`);
-    }
-
-    // Update timestamp
-    const now = new Date().toISOString();
-    const fileDataCopy = { ...fileData, modified_at: now };
-
-    return new Command({
-      update: {
-        [this.stateKey]: {
-          [normalizedOld]: null,
-          [normalizedNew]: fileDataCopy,
-        },
-        messages: [
-          new ToolMessage({
-            content: `File renamed: ${oldPath} -> ${newPath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
 }
 
 /**
@@ -571,22 +489,36 @@ class StateClaudeFileToolMiddleware implements AgentMiddleware {
  * const agent = createAgent({
  *   model,
  *   tools: [],
- *   middleware: [new StateClaudeTextEditorMiddleware()],
+ *   middleware: [StateClaudeTextEditorMiddleware()],
  * });
  * ```
  */
-export class StateClaudeTextEditorMiddleware extends StateClaudeFileToolMiddleware {
-  stateSchema = TextEditorStateSchema;
-
-  constructor(options?: { allowedPathPrefixes?: string[] }) {
-    super({
-      toolType: TEXT_EDITOR_TOOL_TYPE,
+export function StateClaudeTextEditorMiddleware(options?: {
+  allowedPathPrefixes?: string[];
+}) {
+  const textEditorTool = tool(
+    createStateFileToolHandler({
       toolName: TEXT_EDITOR_TOOL_NAME,
       stateKey: "text_editor_files",
-      allowedPathPrefixes: options?.allowedPathPrefixes,
-    });
-    this.name = "StateClaudeTextEditorMiddleware";
-  }
+      allowedPrefixes: options?.allowedPathPrefixes,
+    }),
+    {
+      name: TEXT_EDITOR_TOOL_NAME,
+      description:
+        "Edit files using Anthropic's text editor tool with state-based storage",
+      schema: FileToolCommandSchema,
+      providerToolDefinition: {
+        type: TEXT_EDITOR_TOOL_TYPE,
+        name: TEXT_EDITOR_TOOL_NAME,
+      },
+    }
+  );
+
+  return createMiddleware({
+    name: "StateClaudeTextEditorMiddleware",
+    stateSchema: TextEditorStateSchema,
+    tools: [textEditorTool],
+  });
 }
 
 /**
@@ -604,406 +536,369 @@ export class StateClaudeTextEditorMiddleware extends StateClaudeFileToolMiddlewa
  * const agent = createAgent({
  *   model,
  *   tools: [],
- *   middleware: [new StateClaudeMemoryMiddleware()],
+ *   middleware: [StateClaudeMemoryMiddleware()],
  * });
  * ```
  */
-export class StateClaudeMemoryMiddleware extends StateClaudeFileToolMiddleware {
-  stateSchema = MemoryStateSchema;
-
-  constructor(options?: {
-    allowedPathPrefixes?: string[];
-    systemPrompt?: string;
-  }) {
-    super({
-      toolType: MEMORY_TOOL_TYPE,
+export function StateClaudeMemoryMiddleware(options?: {
+  allowedPathPrefixes?: string[];
+  systemPrompt?: string;
+}) {
+  const memoryTool = tool(
+    createStateFileToolHandler({
       toolName: MEMORY_TOOL_NAME,
       stateKey: "memory_files",
-      allowedPathPrefixes: options?.allowedPathPrefixes || ["/memories"],
-      systemPrompt:
-        options?.systemPrompt !== undefined
-          ? options.systemPrompt
-          : MEMORY_SYSTEM_PROMPT,
-    });
-    this.name = "StateClaudeMemoryMiddleware";
-  }
+      allowedPrefixes: options?.allowedPathPrefixes || ["/memories"],
+    }),
+    {
+      name: MEMORY_TOOL_NAME,
+      description:
+        "Store and retrieve information across conversations using Anthropic's memory tool",
+      schema: FileToolCommandSchema,
+      providerToolDefinition: {
+        type: MEMORY_TOOL_TYPE,
+        name: MEMORY_TOOL_NAME,
+      },
+    }
+  );
+
+  const systemPrompt =
+    options?.systemPrompt !== undefined
+      ? options.systemPrompt
+      : MEMORY_SYSTEM_PROMPT;
+
+  return createMiddleware({
+    name: "StateClaudeMemoryMiddleware",
+    stateSchema: MemoryStateSchema,
+    tools: [memoryTool],
+    wrapModelCall: systemPrompt
+      ? (request, handler) =>
+          handler({
+            ...request,
+            systemPrompt:
+              (request.systemPrompt ? `${request.systemPrompt}\n\n` : "") +
+              systemPrompt,
+          })
+      : undefined,
+  });
 }
 
 /**
- * Base class for filesystem-based file tool middleware (internal).
+ * Helper function to validate and resolve a virtual path to a filesystem path.
  */
-class FilesystemClaudeFileToolMiddleware implements AgentMiddleware {
-  name: string;
-
-  protected toolType: string;
-
-  protected toolName: string;
-
-  protected rootPath: string;
-
-  protected allowedPrefixes: string[];
-
-  protected maxFileSizeBytes: number;
-
-  protected systemPrompt?: string;
-
-  constructor(options: {
-    toolType: string;
-    toolName: string;
-    rootPath: string;
-    allowedPrefixes?: string[];
-    maxFileSizeMb?: number;
-    systemPrompt?: string;
-  }) {
-    this.toolType = options.toolType;
-    this.toolName = options.toolName;
-    this.rootPath = path.resolve(options.rootPath);
-    this.allowedPrefixes = options.allowedPrefixes || ["/"];
-    this.maxFileSizeBytes = (options.maxFileSizeMb || 10) * 1024 * 1024;
-    this.systemPrompt = options.systemPrompt;
-    this.name = `FilesystemClaudeFileToolMiddleware(${this.toolName})`;
-
-    // Create root directory if it doesn't exist
-    if (!fs.existsSync(this.rootPath)) {
-      fs.mkdirSync(this.rootPath, { recursive: true });
-    }
+function validateAndResolvePath(
+  virtualPath: string,
+  rootPath: string,
+  allowedPrefixes: string[]
+): string {
+  // Normalize path
+  let normalizedVirtual = virtualPath;
+  if (!normalizedVirtual.startsWith("/")) {
+    normalizedVirtual = `/${normalizedVirtual}`;
   }
 
-  wrapModelCall: WrapModelCallHook = async (request, handler) => {
-    // Inject system prompt if provided
-    if (this.systemPrompt) {
-      request.systemPrompt = request.systemPrompt
-        ? `${request.systemPrompt}\n\n${this.systemPrompt}`
-        : this.systemPrompt;
-    }
+  // Check for path traversal
+  if (normalizedVirtual.includes("..") || normalizedVirtual.includes("~")) {
+    throw new Error("Path traversal not allowed");
+  }
 
-    return handler(request);
-  };
+  // Convert virtual path to filesystem path
+  const relative = normalizedVirtual.slice(1); // Remove leading /
+  const fullPath = path.resolve(rootPath, relative);
 
-  wrapToolCall: WrapToolCallHook = async (request, handler) => {
-    const toolCall = request.toolCall;
-    const toolName = toolCall.name;
+  // Ensure path is within root
+  if (!fullPath.startsWith(rootPath)) {
+    throw new Error(`Path outside root directory: ${virtualPath}`);
+  }
 
-    if (toolName !== this.toolName) {
-      return handler(request);
-    }
-
-    // Handle tool call
-    try {
-      const args = (toolCall.args || {}) as Record<string, unknown>;
-      const command = args.command as string;
-
-      if (command === "view") {
-        return this.handleView(args, toolCall.id);
-      }
-      if (command === "create") {
-        return this.handleCreate(args, toolCall.id);
-      }
-      if (command === "str_replace") {
-        return this.handleStrReplace(args, toolCall.id);
-      }
-      if (command === "insert") {
-        return this.handleInsert(args, toolCall.id);
-      }
-      if (command === "delete") {
-        return this.handleDelete(args, toolCall.id);
-      }
-      if (command === "rename") {
-        return this.handleRename(args, toolCall.id);
-      }
-
-      return new ToolMessage({
-        content: `Unknown command: ${command}`,
-        tool_call_id: toolCall.id!,
-        name: toolName,
-        status: "error",
-      });
-    } catch (error) {
-      return new ToolMessage({
-        content: String(error),
-        tool_call_id: toolCall.id!,
-        name: toolName,
-        status: "error",
-      });
-    }
-  };
-
-  protected validateAndResolvePath(virtualPath: string): string {
-    // Normalize path
-    let normalizedVirtual = virtualPath;
-    if (!normalizedVirtual.startsWith("/")) {
-      normalizedVirtual = `/${normalizedVirtual}`;
-    }
-
-    // Check for path traversal
-    if (normalizedVirtual.includes("..") || normalizedVirtual.includes("~")) {
-      throw new Error("Path traversal not allowed");
-    }
-
-    // Convert virtual path to filesystem path
-    const relative = normalizedVirtual.slice(1); // Remove leading /
-    const fullPath = path.resolve(this.rootPath, relative);
-
-    // Ensure path is within root
-    if (!fullPath.startsWith(this.rootPath)) {
-      throw new Error(`Path outside root directory: ${virtualPath}`);
-    }
-
-    // Check allowed prefixes
-    const virtualForCheck = `/${path
-      .relative(this.rootPath, fullPath)
-      .replace(/\\/g, "/")}`;
-    const allowed = this.allowedPrefixes.some(
-      (prefix) =>
-        virtualForCheck.startsWith(prefix) ||
-        virtualForCheck === prefix.replace(/\/$/, "")
+  // Check allowed prefixes
+  const virtualForCheck = `/${path
+    .relative(rootPath, fullPath)
+    .replace(/\\/g, "/")}`;
+  const allowed = allowedPrefixes.some(
+    (prefix) =>
+      virtualForCheck.startsWith(prefix) ||
+      virtualForCheck === prefix.replace(/\/$/, "")
+  );
+  if (!allowed) {
+    throw new Error(
+      `Path must start with one of: ${JSON.stringify(allowedPrefixes)}`
     );
-    if (!allowed) {
-      throw new Error(
-        `Path must start with one of: ${JSON.stringify(this.allowedPrefixes)}`
-      );
-    }
-
-    return fullPath;
   }
 
-  protected handleView(
-    args: Record<string, unknown>,
-    toolCallId: string | undefined
-  ): Command {
-    const virtualPath = args.path as string;
-    const fullPath = this.validateAndResolvePath(virtualPath);
+  return fullPath;
+}
 
-    if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
-      throw new Error(`File not found: ${virtualPath}`);
-    }
+/**
+ * Helper function to create a filesystem-based file tool handler.
+ * Handles command execution with actual filesystem operations.
+ */
+function createFilesystemFileToolHandler(options: {
+  toolName: string;
+  rootPath: string;
+  allowedPrefixes: string[];
+  maxFileSizeBytes: number;
+}) {
+  // Create root directory if it doesn't exist
+  if (!fs.existsSync(options.rootPath)) {
+    fs.mkdirSync(options.rootPath, { recursive: true });
+  }
 
-    // Check file size
-    const stats = fs.statSync(fullPath);
-    if (stats.size > this.maxFileSizeBytes) {
-      const maxMb = this.maxFileSizeBytes / 1024 / 1024;
-      throw new Error(`File too large: ${virtualPath} exceeds ${maxMb}MB`);
-    }
+  return async (
+    args: z.infer<typeof FileToolCommandSchema>,
+    config: any
+  ): Promise<Command> => {
+    const toolCallId = config.toolCall?.id as string;
 
-    // Read file
-    let content: string;
     try {
-      content = fs.readFileSync(fullPath, "utf8");
-    } catch (error) {
-      throw new Error(`Cannot decode file ${virtualPath}: ${error}`);
-    }
+      switch (args.command) {
+        case "view": {
+          const fullPath = validateAndResolvePath(
+            args.path,
+            options.rootPath,
+            options.allowedPrefixes
+          );
 
-    // Format with line numbers
-    let lines = content.split("\n");
-    // Remove trailing newline's empty string if present
-    if (lines.length > 0 && lines[lines.length - 1] === "") {
-      lines = lines.slice(0, -1);
-    }
-    const formattedLines = lines.map((line, i) => `${i + 1}|${line}`);
-    const formattedContent = formattedLines.join("\n");
+          if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
+            throw new Error(`File not found: ${args.path}`);
+          }
 
-    return new Command({
-      update: {
-        messages: [
-          new ToolMessage({
-            content: formattedContent,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
+          // Check file size
+          const stats = fs.statSync(fullPath);
+          if (stats.size > options.maxFileSizeBytes) {
+            const maxMb = options.maxFileSizeBytes / 1024 / 1024;
+            throw new Error(`File too large: ${args.path} exceeds ${maxMb}MB`);
+          }
 
-  protected handleCreate(
-    args: Record<string, unknown>,
-    toolCallId: string | undefined
-  ): Command {
-    const virtualPath = args.path as string;
-    const fileText = args.file_text as string;
+          // Read file
+          let content: string;
+          try {
+            content = fs.readFileSync(fullPath, "utf8");
+          } catch (error) {
+            throw new Error(`Cannot decode file ${args.path}: ${error}`);
+          }
 
-    const fullPath = this.validateAndResolvePath(virtualPath);
+          // Format with line numbers
+          let lines = content.split("\n");
+          // Remove trailing newline's empty string if present
+          if (lines.length > 0 && lines[lines.length - 1] === "") {
+            lines = lines.slice(0, -1);
+          }
+          const formattedLines = lines.map((line, i) => `${i + 1}|${line}`);
+          const formattedContent = formattedLines.join("\n");
 
-    // Create parent directories
-    const dir = path.dirname(fullPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+          return new Command({
+            update: {
+              messages: [
+                new ToolMessage({
+                  content: formattedContent,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
 
-    // Write file
-    fs.writeFileSync(fullPath, `${fileText}\n`, "utf8");
+        case "create": {
+          const fullPath = validateAndResolvePath(
+            args.path,
+            options.rootPath,
+            options.allowedPrefixes
+          );
 
-    return new Command({
-      update: {
-        messages: [
-          new ToolMessage({
-            content: `File created: ${virtualPath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
+          // Create parent directories
+          const dir = path.dirname(fullPath);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+          }
 
-  protected handleStrReplace(
-    args: Record<string, unknown>,
-    toolCallId: string | undefined
-  ): Command {
-    const virtualPath = args.path as string;
-    const oldStr = args.old_str as string;
-    const newStr = (args.new_str as string) || "";
+          // Write file
+          fs.writeFileSync(fullPath, `${args.file_text}\n`, "utf8");
 
-    const fullPath = this.validateAndResolvePath(virtualPath);
+          return new Command({
+            update: {
+              messages: [
+                new ToolMessage({
+                  content: `File created: ${args.path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
 
-    if (!fs.existsSync(fullPath)) {
-      throw new Error(`File not found: ${virtualPath}`);
-    }
+        case "str_replace": {
+          const fullPath = validateAndResolvePath(
+            args.path,
+            options.rootPath,
+            options.allowedPrefixes
+          );
 
-    // Read file
-    const content = fs.readFileSync(fullPath, "utf8");
+          if (!fs.existsSync(fullPath)) {
+            throw new Error(`File not found: ${args.path}`);
+          }
 
-    // Replace string
-    if (!content.includes(oldStr)) {
-      throw new Error(`String not found in file: ${oldStr}`);
-    }
+          // Read file
+          const content = fs.readFileSync(fullPath, "utf8");
 
-    const newContent = content.replace(oldStr, newStr);
+          // Replace string
+          if (!content.includes(args.old_str)) {
+            throw new Error(`String not found in file: ${args.old_str}`);
+          }
 
-    // Write back
-    fs.writeFileSync(fullPath, newContent, "utf8");
+          const newContent = content.replace(args.old_str, args.new_str);
 
-    return new Command({
-      update: {
-        messages: [
-          new ToolMessage({
-            content: `String replaced in ${virtualPath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
+          // Write back
+          fs.writeFileSync(fullPath, newContent, "utf8");
 
-  protected handleInsert(
-    args: Record<string, unknown>,
-    toolCallId: string | undefined
-  ): Command {
-    const virtualPath = args.path as string;
-    const insertLine = args.insert_line as number;
-    const textToInsert = args.new_str as string;
+          return new Command({
+            update: {
+              messages: [
+                new ToolMessage({
+                  content: `String replaced in ${args.path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
 
-    const fullPath = this.validateAndResolvePath(virtualPath);
+        case "insert": {
+          const fullPath = validateAndResolvePath(
+            args.path,
+            options.rootPath,
+            options.allowedPrefixes
+          );
 
-    if (!fs.existsSync(fullPath)) {
-      throw new Error(`File not found: ${virtualPath}`);
-    }
+          if (!fs.existsSync(fullPath)) {
+            throw new Error(`File not found: ${args.path}`);
+          }
 
-    // Read file
-    const content = fs.readFileSync(fullPath, "utf8");
-    let lines = content.split("\n");
-    // Handle trailing newline
-    let hadTrailingNewline = false;
-    if (lines.length > 0 && lines[lines.length - 1] === "") {
-      lines = lines.slice(0, -1);
-      hadTrailingNewline = true;
-    }
+          // Read file
+          const content = fs.readFileSync(fullPath, "utf8");
+          let lines = content.split("\n");
+          // Handle trailing newline
+          let hadTrailingNewline = false;
+          if (lines.length > 0 && lines[lines.length - 1] === "") {
+            lines = lines.slice(0, -1);
+            hadTrailingNewline = true;
+          }
 
-    const newLines = textToInsert.split("\n");
+          const newLines = args.new_str.split("\n");
 
-    // Insert after insert_line (0-indexed)
-    const updatedLines = [
-      ...lines.slice(0, insertLine),
-      ...newLines,
-      ...lines.slice(insertLine),
-    ];
+          // Insert after insert_line (0-indexed)
+          const updatedLines = [
+            ...lines.slice(0, args.insert_line),
+            ...newLines,
+            ...lines.slice(args.insert_line),
+          ];
 
-    // Write back
-    let newContent = updatedLines.join("\n");
-    if (hadTrailingNewline) {
-      newContent += "\n";
-    }
-    fs.writeFileSync(fullPath, newContent, "utf8");
+          // Write back
+          let newContent = updatedLines.join("\n");
+          if (hadTrailingNewline) {
+            newContent += "\n";
+          }
+          fs.writeFileSync(fullPath, newContent, "utf8");
 
-    return new Command({
-      update: {
-        messages: [
-          new ToolMessage({
-            content: `Text inserted in ${virtualPath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
+          return new Command({
+            update: {
+              messages: [
+                new ToolMessage({
+                  content: `Text inserted in ${args.path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
 
-  protected handleDelete(
-    args: Record<string, unknown>,
-    toolCallId: string | undefined
-  ): Command {
-    const virtualPath = args.path as string;
-    const fullPath = this.validateAndResolvePath(virtualPath);
+        case "delete": {
+          const fullPath = validateAndResolvePath(
+            args.path,
+            options.rootPath,
+            options.allowedPrefixes
+          );
 
-    if (fs.existsSync(fullPath)) {
-      const stats = fs.statSync(fullPath);
-      if (stats.isFile()) {
-        fs.unlinkSync(fullPath);
-      } else if (stats.isDirectory()) {
-        fs.rmSync(fullPath, { recursive: true });
+          if (fs.existsSync(fullPath)) {
+            const stats = fs.statSync(fullPath);
+            if (stats.isFile()) {
+              fs.unlinkSync(fullPath);
+            } else if (stats.isDirectory()) {
+              fs.rmSync(fullPath, { recursive: true });
+            }
+          }
+          // If doesn't exist, silently succeed
+
+          return new Command({
+            update: {
+              messages: [
+                new ToolMessage({
+                  content: `File deleted: ${args.path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
+
+        case "rename": {
+          const oldFull = validateAndResolvePath(
+            args.old_path,
+            options.rootPath,
+            options.allowedPrefixes
+          );
+          const newFull = validateAndResolvePath(
+            args.new_path,
+            options.rootPath,
+            options.allowedPrefixes
+          );
+
+          if (!fs.existsSync(oldFull)) {
+            throw new Error(`File not found: ${args.old_path}`);
+          }
+
+          // Create parent directory for new path
+          const dir = path.dirname(newFull);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+          }
+
+          // Rename
+          fs.renameSync(oldFull, newFull);
+
+          return new Command({
+            update: {
+              messages: [
+                new ToolMessage({
+                  content: `File renamed: ${args.old_path} -> ${args.new_path}`,
+                  tool_call_id: toolCallId,
+                  name: options.toolName,
+                }),
+              ],
+            },
+          });
+        }
       }
+    } catch (error) {
+      return new Command({
+        update: {
+          messages: [
+            new ToolMessage({
+              content: String(error),
+              tool_call_id: toolCallId,
+              name: options.toolName,
+              status: "error",
+            }),
+          ],
+        },
+      });
     }
-    // If doesn't exist, silently succeed
-
-    return new Command({
-      update: {
-        messages: [
-          new ToolMessage({
-            content: `File deleted: ${virtualPath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
-
-  protected handleRename(
-    args: Record<string, unknown>,
-    toolCallId: string | undefined
-  ): Command {
-    const oldPath = args.old_path as string;
-    const newPath = args.new_path as string;
-
-    const oldFull = this.validateAndResolvePath(oldPath);
-    const newFull = this.validateAndResolvePath(newPath);
-
-    if (!fs.existsSync(oldFull)) {
-      throw new Error(`File not found: ${oldPath}`);
-    }
-
-    // Create parent directory for new path
-    const dir = path.dirname(newFull);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    // Rename
-    fs.renameSync(oldFull, newFull);
-
-    return new Command({
-      update: {
-        messages: [
-          new ToolMessage({
-            content: `File renamed: ${oldPath} -> ${newPath}`,
-            tool_call_id: toolCallId!,
-            name: this.toolName,
-          }),
-        ],
-      },
-    });
-  }
+  };
 }
 
 /**
@@ -1021,26 +916,43 @@ class FilesystemClaudeFileToolMiddleware implements AgentMiddleware {
  *   model,
  *   tools: [],
  *   middleware: [
- *     new FilesystemClaudeTextEditorMiddleware({ rootPath: "/workspace" })
+ *     FilesystemClaudeTextEditorMiddleware({ rootPath: "/workspace" })
  *   ],
  * });
  * ```
  */
-export class FilesystemClaudeTextEditorMiddleware extends FilesystemClaudeFileToolMiddleware {
-  constructor(options: {
-    rootPath: string;
-    allowedPrefixes?: string[];
-    maxFileSizeMb?: number;
-  }) {
-    super({
-      toolType: TEXT_EDITOR_TOOL_TYPE,
+export function FilesystemClaudeTextEditorMiddleware(options: {
+  rootPath: string;
+  allowedPrefixes?: string[];
+  maxFileSizeMb?: number;
+}) {
+  const resolvedRootPath = path.resolve(options.rootPath);
+  const maxFileSizeBytes = (options.maxFileSizeMb || 10) * 1024 * 1024;
+  const allowedPrefixes = options.allowedPrefixes || ["/"];
+
+  const textEditorTool = tool(
+    createFilesystemFileToolHandler({
       toolName: TEXT_EDITOR_TOOL_NAME,
-      rootPath: options.rootPath,
-      allowedPrefixes: options.allowedPrefixes,
-      maxFileSizeMb: options.maxFileSizeMb,
-    });
-    this.name = "FilesystemClaudeTextEditorMiddleware";
-  }
+      rootPath: resolvedRootPath,
+      allowedPrefixes,
+      maxFileSizeBytes,
+    }),
+    {
+      name: TEXT_EDITOR_TOOL_NAME,
+      description:
+        "Edit files using Anthropic's text editor tool with filesystem-based storage",
+      schema: FileToolCommandSchema,
+      providerToolDefinition: {
+        type: TEXT_EDITOR_TOOL_TYPE,
+        name: TEXT_EDITOR_TOOL_NAME,
+      },
+    }
+  );
+
+  return createMiddleware({
+    name: "FilesystemClaudeTextEditorMiddleware",
+    tools: [textEditorTool],
+  });
 }
 
 /**
@@ -1059,29 +971,56 @@ export class FilesystemClaudeTextEditorMiddleware extends FilesystemClaudeFileTo
  *   model,
  *   tools: [],
  *   middleware: [
- *     new FilesystemClaudeMemoryMiddleware({ rootPath: "/workspace" })
+ *     FilesystemClaudeMemoryMiddleware({ rootPath: "/workspace" })
  *   ],
  * });
  * ```
  */
-export class FilesystemClaudeMemoryMiddleware extends FilesystemClaudeFileToolMiddleware {
-  constructor(options: {
-    rootPath: string;
-    allowedPrefixes?: string[];
-    maxFileSizeMb?: number;
-    systemPrompt?: string;
-  }) {
-    super({
-      toolType: MEMORY_TOOL_TYPE,
+export function FilesystemClaudeMemoryMiddleware(options: {
+  rootPath: string;
+  allowedPrefixes?: string[];
+  maxFileSizeMb?: number;
+  systemPrompt?: string;
+}) {
+  const resolvedRootPath = path.resolve(options.rootPath);
+  const maxFileSizeBytes = (options.maxFileSizeMb || 10) * 1024 * 1024;
+  const allowedPrefixes = options.allowedPrefixes || ["/memories"];
+
+  const memoryTool = tool(
+    createFilesystemFileToolHandler({
       toolName: MEMORY_TOOL_NAME,
-      rootPath: options.rootPath,
-      allowedPrefixes: options.allowedPrefixes || ["/memories"],
-      maxFileSizeMb: options.maxFileSizeMb,
-      systemPrompt:
-        options.systemPrompt !== undefined
-          ? options.systemPrompt
-          : MEMORY_SYSTEM_PROMPT,
-    });
-    this.name = "FilesystemClaudeMemoryMiddleware";
-  }
+      rootPath: resolvedRootPath,
+      allowedPrefixes,
+      maxFileSizeBytes,
+    }),
+    {
+      name: MEMORY_TOOL_NAME,
+      description:
+        "Store and retrieve information across conversations using Anthropic's memory tool with filesystem-based storage",
+      schema: FileToolCommandSchema,
+      providerToolDefinition: {
+        type: MEMORY_TOOL_TYPE,
+        name: MEMORY_TOOL_NAME,
+      },
+    }
+  );
+
+  const systemPrompt =
+    options.systemPrompt !== undefined
+      ? options.systemPrompt
+      : MEMORY_SYSTEM_PROMPT;
+
+  return createMiddleware({
+    name: "FilesystemClaudeMemoryMiddleware",
+    tools: [memoryTool],
+    wrapModelCall: systemPrompt
+      ? (request, handler) =>
+          handler({
+            ...request,
+            systemPrompt:
+              (request.systemPrompt ? `${request.systemPrompt}\n\n` : "") +
+              systemPrompt,
+          })
+      : undefined,
+  });
 }
