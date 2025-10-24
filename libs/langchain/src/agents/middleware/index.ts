@@ -44,3 +44,17 @@ export {
 export { modelFallbackMiddleware } from "./modelFallback.js";
 export { type AgentMiddleware } from "./types.js";
 export { countTokensApproximately } from "./utils.js";
+export {
+  createStateClaudeTextEditorMiddleware,
+  createStateClaudeMemoryMiddleware,
+  createFilesystemClaudeTextEditorMiddleware,
+  createFilesystemClaudeMemoryMiddleware,
+  TEXT_EDITOR_TOOL_TYPE,
+  TEXT_EDITOR_TOOL_NAME,
+  MEMORY_TOOL_TYPE,
+  MEMORY_TOOL_NAME,
+  MEMORY_SYSTEM_PROMPT,
+  filesReducer,
+  type FileData,
+  type AnthropicToolsState,
+} from "./anthropicTools/index.js";
