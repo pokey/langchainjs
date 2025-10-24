@@ -58,3 +58,7 @@ export {
   type FileData,
   type AnthropicToolsState,
 } from "./anthropicTools/index.js";
+export {
+  StateFileSearchMiddleware,
+  FilesystemFileSearchMiddleware,
+} from "./anthropicTools/fileSearch.js";
